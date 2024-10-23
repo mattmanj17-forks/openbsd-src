@@ -1,4 +1,4 @@
-/* $OpenBSD: ecp_oct.c,v 1.22 2024/10/22 12:09:57 tb Exp $ */
+/* $OpenBSD: ecp_oct.c,v 1.26 2024/10/22 21:28:53 tb Exp $ */
 /* Includes code written by Lenka Fibikova <fibikova@exp-math.uni-essen.de>
  * for the OpenSSL project.
  * Includes code written by Bodo Moeller for the OpenSSL project.
@@ -63,12 +63,15 @@
  */
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include <openssl/bn.h>
 #include <openssl/ec.h>
 #include <openssl/err.h>
 
 #include "ec_local.h"
+
+#include "bytestring.h"
 
 int
 ec_GFp_simple_set_compressed_coordinates(const EC_GROUP *group,
@@ -182,97 +185,231 @@ ec_GFp_simple_set_compressed_coordinates(const EC_GROUP *group,
 	return ret;
 }
 
+/*
+ * Only the last three bits of the leading octet of a point should be set.
+ * Bits 3 and 2 encode the conversion form for all points except the point
+ * at infinity. In compressed and hybrid form bit 1 indicates if the even
+ * or the odd solution of the quadratic equation for y should be used.
+ *
+ * The public point_conversion_t enum lacks the point at infinity, so we
+ * ignore it except at the API boundary.
+ */
+
+#define EC_OCT_YBIT			0x01
+
+#define EC_OCT_POINT_AT_INFINITY	0x00
+#define EC_OCT_POINT_COMPRESSED		0x02
+#define EC_OCT_POINT_UNCOMPRESSED	0x04
+#define EC_OCT_POINT_HYBRID		0x06
+#define EC_OCT_POINT_CONVERSION_MASK	0x06
+
+static int
+ec_oct_conversion_form_is_valid(uint8_t form)
+{
+	return (form & EC_OCT_POINT_CONVERSION_MASK) == form;
+}
+
+static int
+ec_oct_check_hybrid_ybit_is_consistent(uint8_t form, int ybit, const BIGNUM *y)
+{
+	if (form == EC_OCT_POINT_HYBRID && ybit != BN_is_odd(y)) {
+		ECerror(EC_R_INVALID_ENCODING);
+		return 0;
+	}
+
+	return 1;
+}
+
+/* Nonzero y-bit only makes sense with compressed or hybrid encoding. */
+static int
+ec_oct_nonzero_ybit_allowed(uint8_t form)
+{
+	return form == EC_OCT_POINT_COMPRESSED || form == EC_OCT_POINT_HYBRID;
+}
+
+static int
+ec_oct_add_leading_octet_cbb(CBB *cbb, uint8_t form, int ybit)
+{
+	if (ec_oct_nonzero_ybit_allowed(form) && ybit != 0)
+		form |= EC_OCT_YBIT;
+
+	return CBB_add_u8(cbb, form);
+}
+
+static int
+ec_oct_get_leading_octet_cbs(CBS *cbs, uint8_t *out_form, int *out_ybit)
+{
+	uint8_t octet;
+
+	if (!CBS_get_u8(cbs, &octet)) {
+		ECerror(EC_R_BUFFER_TOO_SMALL);
+		return 0;
+	}
+
+	*out_ybit = octet & EC_OCT_YBIT;
+	*out_form = octet & ~EC_OCT_YBIT;
+
+	if (!ec_oct_conversion_form_is_valid(*out_form)) {
+		ECerror(EC_R_INVALID_ENCODING);
+		return 0;
+	}
+
+	if (*out_ybit != 0 && !ec_oct_nonzero_ybit_allowed(*out_form)) {
+		ECerror(EC_R_INVALID_ENCODING);
+		return 0;
+	}
+
+	return 1;
+}
+
+static int
+ec_oct_encoded_length(const EC_GROUP *group, uint8_t form, size_t *out_len)
+{
+	switch (form) {
+	case EC_OCT_POINT_AT_INFINITY:
+		*out_len = 1;
+		return 1;
+	case EC_OCT_POINT_COMPRESSED:
+		*out_len = 1 + BN_num_bytes(&group->field);
+		return 1;
+	case EC_OCT_POINT_UNCOMPRESSED:
+	case EC_OCT_POINT_HYBRID:
+		*out_len = 1 + 2 * BN_num_bytes(&group->field);
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int
+ec_oct_field_element_is_valid(const EC_GROUP *group, const BIGNUM *bn)
+{
+	/* Ensure bn is in the range [0, field). */
+	return !BN_is_negative(bn) && BN_cmp(&group->field, bn) > 0;
+}
+
+static int
+ec_oct_add_field_element_cbb(CBB *cbb, const EC_GROUP *group, const BIGNUM *bn)
+{
+	uint8_t *buf = NULL;
+	int buf_len = BN_num_bytes(&group->field);
+
+	if (!ec_oct_field_element_is_valid(group, bn)) {
+		ECerror(EC_R_BIGNUM_OUT_OF_RANGE);
+		return 0;
+	}
+	if (!CBB_add_space(cbb, &buf, buf_len)) {
+		ECerror(ERR_R_MALLOC_FAILURE);
+		return 0;
+	}
+	if (BN_bn2binpad(bn, buf, buf_len) != buf_len) {
+		ECerror(ERR_R_MALLOC_FAILURE);
+		return 0;
+	}
+
+	return 1;
+}
+
+static int
+ec_oct_get_field_element_cbs(CBS *cbs, const EC_GROUP *group, BIGNUM *bn)
+{
+	CBS field_element;
+
+	if (!CBS_get_bytes(cbs, &field_element, BN_num_bytes(&group->field))) {
+		ECerror(EC_R_INVALID_ENCODING);
+		return 0;
+	}
+	if (!BN_bin2bn(CBS_data(&field_element), CBS_len(&field_element), bn)) {
+		ECerror(ERR_R_MALLOC_FAILURE);
+		return 0;
+	}
+	if (!ec_oct_field_element_is_valid(group, bn)) {
+		ECerror(EC_R_BIGNUM_OUT_OF_RANGE);
+		return 0;
+	}
+
+	return 1;
+}
+
 size_t
 ec_GFp_simple_point2oct(const EC_GROUP *group, const EC_POINT *point,
-    point_conversion_form_t form, unsigned char *buf, size_t len, BN_CTX *ctx)
+    point_conversion_form_t conversion_form, unsigned char *buf, size_t len,
+    BN_CTX *ctx)
 {
+	CBB cbb;
+	uint8_t form;
 	BIGNUM *x, *y;
-	size_t field_len, i, skip;
+	size_t encoded_length;
 	size_t ret = 0;
 
-	if (form != POINT_CONVERSION_COMPRESSED &&
-	    form != POINT_CONVERSION_UNCOMPRESSED &&
-	    form != POINT_CONVERSION_HYBRID) {
+	if (conversion_form > UINT8_MAX) {
 		ECerror(EC_R_INVALID_FORM);
 		return 0;
 	}
 
-	if (EC_POINT_is_at_infinity(group, point) > 0) {
-		/* encodes to a single 0 octet */
-		if (buf != NULL) {
-			if (len < 1) {
-				ECerror(EC_R_BUFFER_TOO_SMALL);
-				return 0;
-			}
-			buf[0] = 0;
-		}
-		return 1;
+	form = conversion_form;
+
+	/*
+	 * Established behavior is to reject a request for the form 0 for the
+	 * point at infinity even if it is valid.
+	 */
+	if (form == 0 || !ec_oct_conversion_form_is_valid(form)) {
+		ECerror(EC_R_INVALID_FORM);
+		return 0;
 	}
 
-	/* ret := required output buffer length */
-	field_len = BN_num_bytes(&group->field);
-	ret = (form == POINT_CONVERSION_COMPRESSED) ? 1 + field_len : 1 + 2 * field_len;
+	if (EC_POINT_is_at_infinity(group, point))
+		form = EC_OCT_POINT_AT_INFINITY;
 
+	if (!ec_oct_encoded_length(group, form, &encoded_length)) {
+		ECerror(EC_R_INVALID_FORM);
+		return 0;
+	}
+
+	if (buf == NULL)
+		return encoded_length;
+
+	if (len < encoded_length) {
+		ECerror(EC_R_BUFFER_TOO_SMALL);
+		return 0;
+	}
+
+	CBB_init_fixed(&cbb, buf, len);
 	BN_CTX_start(ctx);
 
-	/* if 'buf' is NULL, just return required length */
-	if (buf != NULL) {
-		if (len < ret) {
-			ECerror(EC_R_BUFFER_TOO_SMALL);
-			goto err;
-		}
+	if ((x = BN_CTX_get(ctx)) == NULL)
+		goto err;
+	if ((y = BN_CTX_get(ctx)) == NULL)
+		goto err;
+	if (!EC_POINT_get_affine_coordinates(group, point, x, y, ctx))
+		goto err;
 
-		if ((x = BN_CTX_get(ctx)) == NULL)
-			goto err;
-		if ((y = BN_CTX_get(ctx)) == NULL)
-			goto err;
+	if (!ec_oct_add_leading_octet_cbb(&cbb, form, BN_is_odd(y)))
+		goto err;
 
-		if (!EC_POINT_get_affine_coordinates(group, point, x, y, ctx))
+	if (form == EC_OCT_POINT_AT_INFINITY) {
+		/* Encoded in leading octet. */;
+	} else if (form == EC_OCT_POINT_COMPRESSED) {
+		if (!ec_oct_add_field_element_cbb(&cbb, group, x))
 			goto err;
+	} else {
+		if (!ec_oct_add_field_element_cbb(&cbb, group, x))
+			goto err;
+		if (!ec_oct_add_field_element_cbb(&cbb, group, y))
+			goto err;
+	}
 
-		if ((form == POINT_CONVERSION_COMPRESSED || form == POINT_CONVERSION_HYBRID) && BN_is_odd(y))
-			buf[0] = form + 1;
-		else
-			buf[0] = form;
+	if (!CBB_finish(&cbb, NULL, &ret))
+		goto err;
 
-		i = 1;
-
-		skip = field_len - BN_num_bytes(x);
-		if (skip > field_len) {
-			ECerror(ERR_R_INTERNAL_ERROR);
-			goto err;
-		}
-		while (skip > 0) {
-			buf[i++] = 0;
-			skip--;
-		}
-		skip = BN_bn2bin(x, buf + i);
-		i += skip;
-		if (i != 1 + field_len) {
-			ECerror(ERR_R_INTERNAL_ERROR);
-			goto err;
-		}
-		if (form == POINT_CONVERSION_UNCOMPRESSED || form == POINT_CONVERSION_HYBRID) {
-			skip = field_len - BN_num_bytes(y);
-			if (skip > field_len) {
-				ECerror(ERR_R_INTERNAL_ERROR);
-				goto err;
-			}
-			while (skip > 0) {
-				buf[i++] = 0;
-				skip--;
-			}
-			skip = BN_bn2bin(y, buf + i);
-			i += skip;
-		}
-		if (i != ret) {
-			ECerror(ERR_R_INTERNAL_ERROR);
-			goto err;
-		}
+	if (ret != encoded_length) {
+		ret = 0;
+		goto err;
 	}
 
  err:
 	BN_CTX_end(ctx);
+	CBB_cleanup(&cbb);
 
 	return ret;
 }
@@ -281,44 +418,13 @@ int
 ec_GFp_simple_oct2point(const EC_GROUP *group, EC_POINT *point,
     const unsigned char *buf, size_t len, BN_CTX *ctx)
 {
-	point_conversion_form_t form;
-	int y_bit;
+	CBS cbs;
+	uint8_t form;
+	int ybit;
 	BIGNUM *x, *y;
-	size_t field_len, enc_len;
 	int ret = 0;
 
-	if (len == 0) {
-		ECerror(EC_R_BUFFER_TOO_SMALL);
-		return 0;
-	}
-	form = buf[0];
-	y_bit = form & 1;
-	form = form & ~1U;
-	if ((form != 0) && (form != POINT_CONVERSION_COMPRESSED)
-	    && (form != POINT_CONVERSION_UNCOMPRESSED)
-	    && (form != POINT_CONVERSION_HYBRID)) {
-		ECerror(EC_R_INVALID_ENCODING);
-		return 0;
-	}
-	if ((form == 0 || form == POINT_CONVERSION_UNCOMPRESSED) && y_bit) {
-		ECerror(EC_R_INVALID_ENCODING);
-		return 0;
-	}
-	if (form == 0) {
-		if (len != 1) {
-			ECerror(EC_R_INVALID_ENCODING);
-			return 0;
-		}
-		return EC_POINT_set_to_infinity(group, point);
-	}
-	field_len = BN_num_bytes(&group->field);
-	enc_len = (form == POINT_CONVERSION_COMPRESSED) ? 1 + field_len : 1 + 2 * field_len;
-
-	if (len != enc_len) {
-		ECerror(EC_R_INVALID_ENCODING);
-		return 0;
-	}
-
+	CBS_init(&cbs, buf, len);
 	BN_CTX_start(ctx);
 
 	if ((x = BN_CTX_get(ctx)) == NULL)
@@ -326,38 +432,31 @@ ec_GFp_simple_oct2point(const EC_GROUP *group, EC_POINT *point,
 	if ((y = BN_CTX_get(ctx)) == NULL)
 		goto err;
 
-	if (!BN_bin2bn(buf + 1, field_len, x))
+	if (!ec_oct_get_leading_octet_cbs(&cbs, &form, &ybit))
 		goto err;
-	if (BN_ucmp(x, &group->field) >= 0) {
-		ECerror(EC_R_INVALID_ENCODING);
-		goto err;
-	}
-	if (form == POINT_CONVERSION_COMPRESSED) {
-		/*
-		 * EC_POINT_set_compressed_coordinates checks that the point
-		 * is on the curve as required by X9.62.
-		 */
-		if (!EC_POINT_set_compressed_coordinates(group, point, x, y_bit, ctx))
+
+	if (form == EC_OCT_POINT_AT_INFINITY) {
+		if (!EC_POINT_set_to_infinity(group, point))
+			goto err;
+	} else if (form == EC_OCT_POINT_COMPRESSED) {
+		if (!ec_oct_get_field_element_cbs(&cbs, group, x))
+			goto err;
+		if (!EC_POINT_set_compressed_coordinates(group, point, x, ybit, ctx))
 			goto err;
 	} else {
-		if (!BN_bin2bn(buf + 1 + field_len, field_len, y))
+		if (!ec_oct_get_field_element_cbs(&cbs, group, x))
 			goto err;
-		if (BN_ucmp(y, &group->field) >= 0) {
-			ECerror(EC_R_INVALID_ENCODING);
+		if (!ec_oct_get_field_element_cbs(&cbs, group, y))
 			goto err;
-		}
-		if (form == POINT_CONVERSION_HYBRID) {
-			if (y_bit != BN_is_odd(y)) {
-				ECerror(EC_R_INVALID_ENCODING);
-				goto err;
-			}
-		}
-		/*
-		 * EC_POINT_set_affine_coordinates checks that the point is
-		 * on the curve as required by X9.62.
-		 */
+		if (!ec_oct_check_hybrid_ybit_is_consistent(form, ybit, y))
+			goto err;
 		if (!EC_POINT_set_affine_coordinates(group, point, x, y, ctx))
 			goto err;
+	}
+
+	if (CBS_len(&cbs) > 0) {
+		ECerror(EC_R_INVALID_ENCODING);
+		goto err;
 	}
 
 	ret = 1;
